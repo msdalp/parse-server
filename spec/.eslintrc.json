@@ -15,6 +15,7 @@
       "equal": true,
       "expectAsync": true,
       "notEqual": true,
+      "it_id": true,
       "it_only_db": true,
       "it_only_mongodb_version": true,
       "it_only_postgres_version": true,
@@ -34,7 +35,8 @@
       "jequal": true,
       "create": true,
       "arrayContains": true,
-      "databaseAdapter": true
+      "databaseAdapter": true,
+      "databaseURI": true
     },
     "rules": {
       "no-console": [0],

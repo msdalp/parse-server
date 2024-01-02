@@ -55,31 +55,35 @@ const transformObjectACL = ({ ACL, ...result }) => {
   return result;
 };
 
-const specialQuerykeys = [
-  '$and',
-  '$or',
-  '$nor',
-  '_rperm',
-  '_wperm',
-  '_perishable_token',
+const specialQueryKeys = ['$and', '$or', '$nor', '_rperm', '_wperm'];
+const specialMasterQueryKeys = [
+  ...specialQueryKeys,
   '_email_verify_token',
+  '_perishable_token',
+  '_tombstone',
   '_email_verify_token_expires_at',
-  '_account_lockout_expires_at',
   '_failed_login_count',
+  '_account_lockout_expires_at',
+  '_password_changed_at',
+  '_password_history',
 ];
 
-const isSpecialQueryKey = key => {
-  return specialQuerykeys.indexOf(key) >= 0;
-};
-
-const validateQuery = (query: any): void => {
+const validateQuery = (
+  query: any,
+  isMaster: boolean,
+  isMaintenance: boolean,
+  update: boolean
+): void => {
+  if (isMaintenance) {
+    isMaster = true;
+  }
   if (query.ACL) {
     throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Cannot query on ACL.');
   }
 
   if (query.$or) {
     if (query.$or instanceof Array) {
-      query.$or.forEach(validateQuery);
+      query.$or.forEach(value => validateQuery(value, isMaster, isMaintenance, update));
     } else {
       throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Bad $or format - use an array value.');
     }
@@ -87,7 +91,7 @@ const validateQuery = (query: any): void => {
 
   if (query.$and) {
     if (query.$and instanceof Array) {
-      query.$and.forEach(validateQuery);
+      query.$and.forEach(value => validateQuery(value, isMaster, isMaintenance, update));
     } else {
       throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Bad $and format - use an array value.');
     }
@@ -95,7 +99,7 @@ const validateQuery = (query: any): void => {
 
   if (query.$nor) {
     if (query.$nor instanceof Array && query.$nor.length > 0) {
-      query.$nor.forEach(validateQuery);
+      query.$nor.forEach(value => validateQuery(value, isMaster, isMaintenance, update));
     } else {
       throw new Parse.Error(
         Parse.Error.INVALID_QUERY,
@@ -115,7 +119,11 @@ const validateQuery = (query: any): void => {
         }
       }
     }
-    if (!isSpecialQueryKey(key) && !key.match(/^[a-zA-Z][a-zA-Z0-9_\.]*$/)) {
+    if (
+      !key.match(/^[a-zA-Z][a-zA-Z0-9_\.]*$/) &&
+      ((!specialQueryKeys.includes(key) && !isMaster && !update) ||
+        (update && isMaster && !specialMasterQueryKeys.includes(key)))
+    ) {
       throw new Parse.Error(Parse.Error.INVALID_KEY_NAME, `Invalid key name: ${key}`);
     }
   });
@@ -124,6 +132,7 @@ const validateQuery = (query: any): void => {
 // Filters out any data that shouldn't be on this REST-formatted object.
 const filterSensitiveData = (
   isMaster: boolean,
+  isMaintenance: boolean,
   aclGroup: any[],
   auth: any,
   operation: any,
@@ -195,6 +204,15 @@ const filterSensitiveData = (
   }
 
   const isUserClass = className === '_User';
+  if (isUserClass) {
+    object.password = object._hashed_password;
+    delete object._hashed_password;
+    delete object.sessionToken;
+  }
+
+  if (isMaintenance) {
+    return object;
+  }
 
   /* special treat for the user class: don't filter protectedFields if currently loggedin user is
   the retrieved user */
@@ -202,33 +220,19 @@ const filterSensitiveData = (
     protectedFields && protectedFields.forEach(k => delete object[k]);
 
     // fields not requested by client (excluded),
-    //but were needed to apply protecttedFields
-    perms.protectedFields &&
-      perms.protectedFields.temporaryKeys &&
-      perms.protectedFields.temporaryKeys.forEach(k => delete object[k]);
+    // but were needed to apply protectedFields
+    perms?.protectedFields?.temporaryKeys?.forEach(k => delete object[k]);
   }
 
-  if (!isUserClass) {
+  for (const key in object) {
+    if (key.charAt(0) === '_') {
+      delete object[key];
+    }
+  }
+
+  if (!isUserClass || isMaster) {
     return object;
   }
-
-  object.password = object._hashed_password;
-  delete object._hashed_password;
-
-  delete object.sessionToken;
-
-  if (isMaster) {
-    return object;
-  }
-  delete object._email_verify_token;
-  delete object._perishable_token;
-  delete object._perishable_token_expires_at;
-  delete object._tombstone;
-  delete object._email_verify_token_expires_at;
-  delete object._failed_login_count;
-  delete object._account_lockout_expires_at;
-  delete object._password_changed_at;
-  delete object._password_history;
 
   if (aclGroup.indexOf(object.objectId) > -1) {
     return object;
@@ -273,6 +277,9 @@ const flattenUpdateOperatorsForCreate = object => {
           if (typeof object[key].amount !== 'number') {
             throw new Parse.Error(Parse.Error.INVALID_JSON, 'objects to add must be an array');
           }
+          object[key] = object[key].amount;
+          break;
+        case 'SetOnInsert':
           object[key] = object[key].amount;
           break;
         case 'Add':
@@ -361,6 +368,22 @@ const relationSchema = {
   fields: { relatedId: { type: 'String' }, owningId: { type: 'String' } },
 };
 
+const convertEmailToLowercase = (object, className, options) => {
+  if (className === '_User' && options.convertEmailToLowercase) {
+    if (typeof object['email'] === 'string') {
+      object['email'] = object['email'].toLowerCase();
+    }
+  }
+};
+
+const convertUsernameToLowercase = (object, className, options) => {
+  if (className === '_User' && options.convertUsernameToLowercase) {
+    if (typeof object['username'] === 'string') {
+      object['username'] = object['username'].toLowerCase();
+    }
+  }
+};
+
 class DatabaseController {
   adapter: StorageAdapter;
   schemaCache: any;
@@ -442,7 +465,8 @@ class DatabaseController {
     className: string,
     object: any,
     query: any,
-    runOptions: QueryOptions
+    runOptions: QueryOptions,
+    maintenance: boolean
   ): Promise<boolean> {
     let schema;
     const acl = runOptions.acl;
@@ -457,7 +481,7 @@ class DatabaseController {
         return this.canAddField(schema, className, object, aclGroup, runOptions);
       })
       .then(() => {
-        return schema.validateObject(className, object, query);
+        return schema.validateObject(className, object, query, maintenance);
       });
   }
 
@@ -470,6 +494,11 @@ class DatabaseController {
     validateOnly: boolean = false,
     validSchemaController: SchemaController.SchemaController
   ): Promise<any> {
+    try {
+      Utils.checkProhibitedKeywords(this.options, update);
+    } catch (error) {
+      return Promise.reject(new Parse.Error(Parse.Error.INVALID_KEY_NAME, error));
+    }
     const originalQuery = query;
     const originalUpdate = update;
     // Make a copy of the object, so we don't mutate the incoming data.
@@ -515,7 +544,7 @@ class DatabaseController {
           if (acl) {
             query = addWriteACL(query, acl);
           }
-          validateQuery(query);
+          validateQuery(query, isMaster, false, true);
           return schemaController
             .getOneSchema(className, true)
             .catch(error => {
@@ -560,6 +589,8 @@ class DatabaseController {
                 }
               }
               update = transformObjectACL(update);
+              convertEmailToLowercase(update, className, this.options);
+              convertUsernameToLowercase(update, className, this.options);
               transformAuthData(className, update, schema);
               if (validateOnly) {
                 return this.adapter.find(className, schema, query, {}).then(result => {
@@ -761,7 +792,7 @@ class DatabaseController {
         if (acl) {
           query = addWriteACL(query, acl);
         }
-        validateQuery(query);
+        validateQuery(query, isMaster, false, false);
         return schemaController
           .getOneSchema(className)
           .catch(error => {
@@ -800,10 +831,17 @@ class DatabaseController {
     validateOnly: boolean = false,
     validSchemaController: SchemaController.SchemaController
   ): Promise<any> {
+    try {
+      Utils.checkProhibitedKeywords(this.options, object);
+    } catch (error) {
+      return Promise.reject(new Parse.Error(Parse.Error.INVALID_KEY_NAME, error));
+    }
     // Make a copy of the object, so we don't mutate the incoming data.
     const originalObject = object;
     object = transformObjectACL(object);
 
+    convertEmailToLowercase(object, className, this.options);
+    convertUsernameToLowercase(object, className, this.options);
     object.createdAt = { iso: object.createdAt, __type: 'Date' };
     object.updatedAt = { iso: object.updatedAt, __type: 'Date' };
 
@@ -932,32 +970,32 @@ class DatabaseController {
   reduceInRelation(className: string, query: any, schema: any): Promise<any> {
     // Search for an in-relation or equal-to-relation
     // Make it sequential for now, not sure of paralleization side effects
+    const promises = [];
     if (query['$or']) {
       const ors = query['$or'];
-      return Promise.all(
-        ors.map((aQuery, index) => {
+      promises.push(
+        ...ors.map((aQuery, index) => {
           return this.reduceInRelation(className, aQuery, schema).then(aQuery => {
             query['$or'][index] = aQuery;
           });
         })
-      ).then(() => {
-        return Promise.resolve(query);
-      });
+      );
     }
     if (query['$and']) {
       const ands = query['$and'];
-      return Promise.all(
-        ands.map((aQuery, index) => {
+      promises.push(
+        ...ands.map((aQuery, index) => {
           return this.reduceInRelation(className, aQuery, schema).then(aQuery => {
             query['$and'][index] = aQuery;
           });
         })
-      ).then(() => {
-        return Promise.resolve(query);
-      });
+      );
     }
 
-    const promises = Object.keys(query).map(key => {
+    const otherKeys = Object.keys(query).map(key => {
+      if (key === '$and' || key === '$or') {
+        return;
+      }
       const t = schema.getExpectedType(className, key);
       if (!t || t.type !== 'Relation') {
         return Promise.resolve(query);
@@ -1019,7 +1057,7 @@ class DatabaseController {
       });
     });
 
-    return Promise.all(promises).then(() => {
+    return Promise.all([...promises, ...otherKeys]).then(() => {
       return Promise.resolve(query);
     });
   }
@@ -1154,7 +1192,8 @@ class DatabaseController {
     auth: any = {},
     validSchemaController: SchemaController.SchemaController
   ): Promise<any> {
-    const isMaster = acl === undefined;
+    const isMaintenance = auth.isMaintenance;
+    const isMaster = acl === undefined || isMaintenance;
     const aclGroup = acl || [];
     op =
       op || (typeof query.objectId == 'string' && Object.keys(query).length === 1 ? 'get' : 'find');
@@ -1196,7 +1235,7 @@ class DatabaseController {
             keys,
             readPreference,
             hint,
-            caseInsensitive,
+            caseInsensitive: this.options.enableCollationCaseComparison ? false : caseInsensitive,
             explain,
           };
           Object.keys(sort).forEach(fieldName => {
@@ -1209,6 +1248,9 @@ class DatabaseController {
                 Parse.Error.INVALID_KEY_NAME,
                 `Invalid field name: ${fieldName}.`
               );
+            }
+            if (!schema.fields[fieldName.split('.')[0]] && fieldName !== 'score') {
+              delete sort[fieldName];
             }
           });
           return (isMaster
@@ -1253,7 +1295,7 @@ class DatabaseController {
                   query = addReadACL(query, aclGroup);
                 }
               }
-              validateQuery(query);
+              validateQuery(query, isMaster, isMaintenance, false);
               if (count) {
                 if (!classExists) {
                   return 0;
@@ -1296,6 +1338,7 @@ class DatabaseController {
                       object = untransformObjectACL(object);
                       return filterSensitiveData(
                         isMaster,
+                        isMaintenance,
                         aclGroup,
                         auth,
                         op,
@@ -1696,30 +1739,26 @@ class DatabaseController {
       throw error;
     });
 
-    await this.adapter
-      .ensureIndex('_User', requiredUserFields, ['username'], 'case_insensitive_username', true)
-      .catch(error => {
-        logger.warn('Unable to create case insensitive username index: ', error);
-        throw error;
-      });
-    await this.adapter
-      .ensureIndex('_User', requiredUserFields, ['username'], 'case_insensitive_username', true)
-      .catch(error => {
-        logger.warn('Unable to create case insensitive username index: ', error);
-        throw error;
-      });
+    if (!this.options.enableCollationCaseComparison) {
+      await this.adapter
+        .ensureIndex('_User', requiredUserFields, ['username'], 'case_insensitive_username', true)
+        .catch(error => {
+          logger.warn('Unable to create case insensitive username index: ', error);
+          throw error;
+        });
+
+      await this.adapter
+        .ensureIndex('_User', requiredUserFields, ['email'], 'case_insensitive_email', true)
+        .catch(error => {
+          logger.warn('Unable to create case insensitive email index: ', error);
+          throw error;
+        });
+    }
 
     await this.adapter.ensureUniqueness('_User', requiredUserFields, ['email']).catch(error => {
       logger.warn('Unable to ensure uniqueness for user email addresses: ', error);
       throw error;
     });
-
-    await this.adapter
-      .ensureIndex('_User', requiredUserFields, ['email'], 'case_insensitive_email', true)
-      .catch(error => {
-        logger.warn('Unable to create case insensitive email index: ', error);
-        throw error;
-      });
 
     await this.adapter.ensureUniqueness('_Role', requiredRoleFields, ['name']).catch(error => {
       logger.warn('Unable to ensure uniqueness for role name: ', error);
@@ -1768,7 +1807,11 @@ class DatabaseController {
     if (this.options && this.options.requestKeywordDenylist) {
       // Scan request data for denied keywords
       for (const keyword of this.options.requestKeywordDenylist) {
-        const match = Utils.objectContainsKeyValue({ firstKey: undefined }, keyword.key, undefined);
+        const match = Utils.objectContainsKeyValue(
+          { [firstKey]: true, [nextPath]: true },
+          keyword.key,
+          true
+        );
         if (match) {
           throw new Parse.Error(
             Parse.Error.INVALID_KEY_NAME,
@@ -1799,7 +1842,7 @@ class DatabaseController {
         keyUpdate &&
         typeof keyUpdate === 'object' &&
         keyUpdate.__op &&
-        ['Add', 'AddUnique', 'Remove', 'Increment'].indexOf(keyUpdate.__op) > -1
+        ['Add', 'AddUnique', 'Remove', 'Increment', 'SetOnInsert'].indexOf(keyUpdate.__op) > -1
       ) {
         // only valid ops that produce an actionable result
         // the op may have happened on a keypath
@@ -1809,8 +1852,8 @@ class DatabaseController {
     return Promise.resolve(response);
   }
 
-  static _validateQuery: any => void;
-  static filterSensitiveData: (boolean, any[], any, any, any, string, any[], any) => void;
+  static _validateQuery: (any, boolean, boolean, boolean) => void;
+  static filterSensitiveData: (boolean, boolean, any[], any, any, any, string, any[], any) => void;
 }
 
 module.exports = DatabaseController;
